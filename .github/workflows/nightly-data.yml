@@ -32,9 +32,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 300
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
 
@@ -42,11 +39,19 @@ jobs:
         with:
           ruby-version: '3.3'
 
-      - name: Pick up last night's copy (so only new data is fetched)
+      # Last night's copy, so only new data is fetched: GitHub's cache first, then the live site
+      - uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: data-${{ github.run_id }}
+          restore-keys: data-
+
+      - name: Pick up last night's copy
         run: |
-          base="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
-          if curl -sfL "$base/data.tar.gz" -o /tmp/data.tar.gz && tar xzf /tmp/data.tar.gz; then
-            echo "Restored $(ls data/teams | wc -l) clubs from the last run"
+          if [ -d data/teams ]; then
+            echo "Restored $(ls data/teams | wc -l) clubs from GitHub's cache"
+          elif curl -sfL "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/data.tar.gz" -o /tmp/data.tar.gz && tar xzf /tmp/data.tar.gz; then
+            echo "Restored $(ls data/teams | wc -l) clubs from the live site"
           else
             echo "No previous copy found, doing a first full build (about 30-60 minutes)"
           fi
@@ -60,6 +65,12 @@ jobs:
           # a few clubs failing shouldn't stop the rest being published; they load live and are retried tomorrow
           ruby build_data.rb $FULL || echo "::warning::Some clubs failed to copy, see the log above"
 
+      # keep tonight's copy even if publishing fails, so tomorrow doesn't start from scratch
+      - uses: actions/cache/save@v4
+        with:
+          path: data
+          key: data-${{ github.run_id }}
+
       - name: Assemble the site
         run: |
           mkdir -p _site
@@ -72,5 +83,16 @@ jobs:
         with:
           path: _site
 
+  # Separate job: if GitHub Pages is slow, re-run just this job without rebuilding the data
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
       - id: deploy
         uses: actions/deploy-pages@v4
+        with:
+          timeout: 1800000
