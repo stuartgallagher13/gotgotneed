@@ -1,0 +1,76 @@
+# Copies every English club's data from Wikidata/Wikipedia each night and publishes it,
+# together with the web version of the app, on GitHub Pages.
+#
+# One-time setup (repo Settings):
+#   1. Secrets and variables > Actions > New repository secret
+#        Name: WIKIMEDIA_CONTACT   Value: the email address Wikimedia can contact about this traffic
+#   2. Pages > Build and deployment > Source: GitHub Actions
+# Then run it once by hand: Actions > Nightly data copy > Run workflow.
+
+name: Nightly data copy
+
+on:
+  schedule:
+    - cron: '30 3 * * *'        # 03:30 UTC every night
+  workflow_dispatch:
+    inputs:
+      full:
+        description: 'Re-copy every season from scratch'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Pick up last night's copy (so only new data is fetched)
+        run: |
+          base="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+          if curl -sfL "$base/data.tar.gz" -o /tmp/data.tar.gz && tar xzf /tmp/data.tar.gz; then
+            echo "Restored $(ls data/teams | wc -l) clubs from the last run"
+          else
+            echo "No previous copy found, doing a first full build (about 30-60 minutes)"
+          fi
+
+      - name: Copy club data
+        env:
+          CONTACT: ${{ secrets.WIKIMEDIA_CONTACT }}
+          FULL: ${{ inputs.full && '--full' || '' }}
+        run: |
+          if [ -z "$CONTACT" ]; then echo "::error::Add the WIKIMEDIA_CONTACT repository secret first"; exit 1; fi
+          # a few clubs failing shouldn't stop the rest being published; they load live and are retried tomorrow
+          ruby build_data.rb $FULL || echo "::warning::Some clubs failed to copy, see the log above"
+
+      - name: Assemble the site
+        run: |
+          mkdir -p _site
+          cp index.html _site/
+          cp -r data _site/
+          tar czf _site/data.tar.gz data
+          echo "Publishing $(ls data/teams | wc -l) clubs, $(du -sh data | cut -f1) of data"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

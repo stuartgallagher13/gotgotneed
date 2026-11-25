@@ -1,0 +1,6 @@
+# built nightly by GitHub Actions and published to GitHub Pages, not stored in git
+data/
+_site/
+build.log
+.claude/
+.DS_Store
