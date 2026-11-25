@@ -168,59 +168,68 @@ async function labels(ids){
   }return out;
 }
 
-async function profile(id){
-  app.innerHTML='<div class="loading">Opening the sticker packet…</div>';
+// A player profile, in the same shape as data/players/<id>.json from the nightly copy:
+// {id,name,desc,wiki,bio,img,credit:{artist,license},num,facts:[[k,v]],teams:[{id,label,s,e,apps,goals,loan,national}],awards:[{label,y}]}
+async function livePlayer(id){
   const d=await api(WD,{action:'wbgetentities',ids:id,props:'labels|descriptions|claims|sitelinks',languages:'en',sitefilter:'enwiki'});
-  const e=d.entities?.[id];if(!e){app.innerHTML='<div class="loading">Player not found.</div>';return}
-  const name=e.labels?.en?.value||id;document.title=name+' · Got Got Need';
+  const e=d.entities?.[id];if(!e||e.missing!==undefined)return null;
   const ref=p=>claims(e,p).map(c=>val(c).id).filter(Boolean);
   const teams=claims(e,'P54'),awards=claims(e,'P166');
   const L=await labels([...ref('P19'),...ref('P27'),...ref('P1532'),...ref('P413'),...ref('P641'),...teams.map(c=>val(c).id),...awards.map(c=>val(c).id)]);
   const lab=id=>L[id]?.label||'';
-
-  // photo + credit from Commons
-  const img=claims(e,'P18')[0];let photo='',credit='';
-  if(img){const f=val(img);photo=`https://commons.wikimedia.org/wiki/Special:FilePath/${encodeURIComponent(f)}?width=500`;
-    try{const m=await api('https://commons.wikimedia.org/w/api.php',{action:'query',titles:'File:'+f,prop:'imageinfo',iiprop:'extmetadata'});
-      const md=Object.values(m.query.pages)[0].imageinfo[0].extmetadata;const strip=h=>(h||'').replace(/<[^>]+>/g,'').trim();
-      credit=`Photo: ${esc(strip(md.Artist?.value)||'Unknown')} · ${esc(md.LicenseShortName?.value||'')} · <a href="https://commons.wikimedia.org/wiki/File:${encodeURIComponent(f)}" target="_blank">source</a>`}catch{}}
-
-  // bio from Wikipedia
-  let bio='',wiki=e.sitelinks?.enwiki?.title;
-  if(wiki){try{const s=await fetch('https://en.wikipedia.org/api/rest_v1/page/summary/'+encodeURIComponent(wiki)).then(r=>r.json());bio=s.extract||''}catch{}}
-
-  // career rows
-  const rows=teams.map(c=>({id:val(c).id,s:yr(qual(c,'P580')),e:yr(qual(c,'P582')),apps:qual(c,'P1350')?.amount,goals:qual(c,'P1351')?.amount,loan:c.qualifiers?.P1642?.some(x=>x.datavalue?.value?.id==='Q2914547')}))
-    .sort((a,b)=>(a.s??9999)-(b.s??9999));
-  const clubs=rows.filter(r=>!L[r.id]?.national),intl=rows.filter(r=>L[r.id]?.national);
-  const n=x=>x==null?'–':parseInt(x);
-  const table=list=>`<table><tr><th>Years</th><th>Team</th><th class="n">Apps</th><th class="n">Goals</th></tr>${list.map(r=>`<tr>
-    <td>${r.s??'?'}–${r.e??(r.s?'':'?')}</td>
-    <td class="team"><span class="crest" style="background:${colour(lab(r.id))}">${esc(initials(lab(r.id)))}</span><a href="#/team/${r.id}">${esc(lab(r.id))}</a>${r.loan?'<span class="loan">loan</span>':''}</td>
-    <td class="n">${n(r.apps)}</td><td class="n">${n(r.goals)}</td></tr>`).join('')}</table>`;
-
+  const P={id,name:e.labels?.en?.value||id,desc:e.descriptions?.en?.value||'',wiki:e.sitelinks?.enwiki?.title||null,bio:'',img:null,credit:null};
+  const img=claims(e,'P18')[0];
+  if(img){P.img=val(img);
+    try{const m=await api('https://commons.wikimedia.org/w/api.php',{action:'query',titles:'File:'+P.img,prop:'imageinfo',iiprop:'extmetadata',iiextmetadatafilter:'Artist|LicenseShortName'});
+      const md=Object.values(m.query.pages)[0].imageinfo[0].extmetadata;P.credit={artist:(md.Artist?.value||'').replace(/<[^>]+>/g,'').trim(),license:md.LicenseShortName?.value||''}}catch{}}
+  if(P.wiki){try{const s=await fetch('https://en.wikipedia.org/api/rest_v1/page/summary/'+encodeURIComponent(P.wiki)).then(r=>r.json());P.bio=s.extract||''}catch{}}
+  P.teams=teams.map(c=>({id:val(c).id,label:lab(val(c).id),national:!!L[val(c).id]?.national,s:yr(qual(c,'P580')),e:yr(qual(c,'P582')),
+    apps:qual(c,'P1350')?parseInt(qual(c,'P1350').amount):null,goals:qual(c,'P1351')?parseInt(qual(c,'P1351').amount):null,
+    loan:!!c.qualifiers?.P1642?.some(x=>x.datavalue?.value?.id==='Q2914547')}));
+  P.awards=awards.map(c=>({label:lab(val(c).id),y:yr(qual(c,'P585'))}));
   const born=claims(e,'P569')[0],h=claims(e,'P2048')[0];
   const height=h?(()=>{const v=val(h),a=parseFloat(v.amount);return v.unit.endsWith('Q11573')?a.toFixed(2)+' m':a+' cm'})():'';
-  const country=lab(ref('P1532')[0]||ref('P27')[0]);
-  const facts=[['Born',born?date(val(born)):''],['Birthplace',lab(ref('P19')[0])],['Nation',country],['Position',ref('P413').map(lab).slice(0,2).join(', ')],['Height',height],['Sport',lab(ref('P641')[0])]].filter(f=>f[1]);
-  const num=claims(e,'P1618')[0];
+  P.facts=[['Born',born?date(val(born)):''],['Birthplace',lab(ref('P19')[0])],['Nation',lab(ref('P1532')[0]||ref('P27')[0])],['Position',ref('P413').map(lab).slice(0,2).join(', ')],['Height',height],['Sport',lab(ref('P641')[0])]].filter(f=>f[1]);
+  const num=claims(e,'P1618')[0];P.num=num?String(val(num)):null;
+  return P;
+}
+
+async function profile(id){
+  app.innerHTML='<div class="loading">Opening the sticker packet…</div>';
+  // 1) the nightly copy (instant), 2) live from Wikidata/Wikipedia for anyone not copied yet
+  let P=null;try{const r=await fetch(`data/players/${id}.json`);if(r.ok)P=await r.json()}catch{}
+  P??=await livePlayer(id);
+  if(!P){app.innerHTML='<div class="loading">Player not found.</div>';return}
+  if(!location.hash.includes(id))return;   // user moved on while loading
+  document.title=P.name+' · Got Got Need';
+  const photo=P.img&&`https://commons.wikimedia.org/wiki/Special:FilePath/${encodeURIComponent(P.img)}?width=500`;
+  const credit=P.img&&`Photo: ${esc(P.credit?.artist||'Unknown')}${P.credit?.license?` · ${esc(P.credit.license)}`:''} · <a href="https://commons.wikimedia.org/wiki/File:${encodeURIComponent(P.img)}" target="_blank">source</a>`;
+  const rows=[...(P.teams||[])].sort((a,b)=>(a.s??9999)-(b.s??9999));
+  const clubs=rows.filter(r=>!r.national),intl=rows.filter(r=>r.national);
+  const n=x=>x==null?'–':x;
+  const table=list=>`<table><tr><th>Years</th><th>Team</th><th class="n">Apps</th><th class="n">Goals</th></tr>${list.map(r=>`<tr>
+    <td>${r.s??'?'}–${r.e??(r.s?'':'?')}</td>
+    <td class="team"><span class="crest" style="background:${colour(r.label)}">${esc(initials(r.label))}</span><a href="#/team/${r.id}">${esc(r.label)}</a>${r.loan?'<span class="loan">loan</span>':''}</td>
+    <td class="n">${n(r.apps)}</td><td class="n">${n(r.goals)}</td></tr>`).join('')}</table>`;
+  const awards=[...(P.awards||[])].filter(a=>a.label).sort((a,b)=>(b.y||0)-(a.y||0));
 
   app.innerHTML=`<div class="profile">
    <div><div class="sticker"><div class="frame">
-      ${photo?`<img class="photo" src="${photo}" alt="${esc(name)}">`:`<div class="nophoto">${esc(initials(name))}</div>`}
-      ${num?`<span class="num">#${esc(val(num))}</span>`:''}
-    </div><div class="banner">${esc(name)}</div>
-    <div class="facts">${facts.map(([k,v])=>`<b>${k}</b><span>${esc(v)}</span>`).join('')}</div>
+      ${photo?`<img class="photo" src="${photo}" alt="${esc(P.name)}">`:`<div class="nophoto">${esc(initials(P.name))}</div>`}
+      ${P.num?`<span class="num">#${esc(P.num)}</span>`:''}
+    </div><div class="banner">${esc(P.name)}</div>
+    <div class="facts">${(P.facts||[]).map(([k,v])=>`<b>${k}</b><span>${esc(v)}</span>`).join('')}</div>
     ${credit?`<div class="credit">${credit}</div>`:''}</div></div>
    <div>
-    <h1 class="name">${esc(name)}</h1><div class="desc">${esc(e.descriptions?.en?.value)}</div>
-    ${bio?`<p class="bio">${esc(bio)}</p><p class="muted" style="font-size:12px">From <a href="https://en.wikipedia.org/wiki/${encodeURIComponent(wiki)}" target="_blank">Wikipedia</a>, CC BY-SA</p>`:''}
+    <h1 class="name">${esc(P.name)}</h1><div class="desc">${esc(P.desc)}</div>
+    ${P.bio?`<p class="bio">${esc(P.bio)}</p><p class="muted" style="font-size:12px">From <a href="https://en.wikipedia.org/wiki/${encodeURIComponent(P.wiki)}" target="_blank">Wikipedia</a>, CC BY-SA</p>`:''}
     ${clubs.length?`<div class="section"><h2>Clubs</h2>${table(clubs)}</div>`:''}
     ${intl.length?`<div class="section"><h2>International</h2>${table(intl)}</div>`:''}
     ${!rows.length?'<p class="muted">No team history recorded yet.</p>':''}
-    ${awards.length?`<div class="section"><h2>Honours & awards</h2><div class="awards">${awards.map(c=>({l:lab(val(c).id),y:yr(qual(c,'P585'))})).sort((a,b)=>(b.y||0)-(a.y||0)).map(a=>`<div class="award">${a.y?`<b>${a.y}</b> `:''}${esc(a.l)}</div>`).join('')}</div></div>`:''}
+    ${awards.length?`<div class="section"><h2>Honours & awards</h2><div class="awards">${awards.map(a=>`<div class="award">${a.y?`<b>${a.y}</b> `:''}${esc(a.label)}</div>`).join('')}</div></div>`:''}
    </div></div>`;
 }
+
 
 /* ---------- team ---------- */
 const sparql=query=>fetch('https://query.wikidata.org/sparql?format=json&query='+encodeURIComponent(query),{headers:{Accept:'application/sparql-results+json'}}).then(r=>{if(!r.ok)throw new Error('Wikidata query service busy, try again');return r.json()});

@@ -9,6 +9,7 @@
 #   data/clubs.json        every club, grouped by division (from the league tables on Wikipedia)
 #   data/teams/<Qid>.json  one file per club: facts, every player who played there (Wikidata),
 #                          and the squad list for each season since 2010 (Wikipedia page history)
+#   data/players/<Qid>.json one file per player at those clubs: profile, career, honours, bio, photo credit
 #
 # Usage:
 #   ruby build_data.rb                 # nightly update: refreshes club lists, player histories and
@@ -327,6 +328,144 @@ def build_team(id)
   [rows.map(&:first).uniq.size, ws[CUR.to_s] ? ws[CUR.to_s]['players'].size : 0]
 end
 
+# ---------- player profiles ----------
+# One file per player who has played for any copied club: data/players/<Qid>.json, in the shape
+# the app's profile page reads. Done 50 players per request, so ~36,000 players is ~2,500 requests.
+require 'zlib'
+PLAYERS = File.join(OUT, 'players')
+COMMONS = 'https://commons.wikimedia.org/w/api.php'
+NATIONAL_RE = /national|under-\d|\bU-?\d\d\b|olympic/i
+$labels = {}
+
+def qual(c, p)
+  c.dig('qualifiers', p, 0, 'datavalue', 'value')
+end
+
+def year_of(t)
+  t && t['time'] ? t['time'][0, 5].to_i : nil
+end
+
+def fetch_labels(ids)
+  need = ids.compact.uniq.reject { |i| $labels.key?(i) }
+  need.each_slice(50) do |sl|
+    get(WD, action: 'wbgetentities', ids: sl.join('|'), props: 'labels', languages: 'en|en-gb|es|fr|de|it')['entities'].each do |id, e|
+      ls = e['labels'] || {}
+      $labels[id] = (ls['en'] || ls.values.first || {})['value'] || ''
+    end
+  end
+end
+
+# first paragraph of each article's intro, like the app's live bio
+def fetch_bios(titles)
+  out = {}
+  titles.compact.uniq.each_slice(20) do |sl|
+    q = get(WP, action: 'query', prop: 'extracts', exintro: 1, explaintext: 1, exlimit: 20, titles: sl.join('|'), redirects: 1, formatversion: 2)['query']
+    by = {}
+    (q['pages'] || []).each { |p| by[p['title']] = p['extract'].to_s.split("\n").map(&:strip).reject(&:empty?).first.to_s[0, 1500] }
+    sl.each { |t| out[t] = by[follow(q, t)] || '' }
+  end
+  out
+end
+
+# photographer and licence for each Commons photo
+def fetch_credits(files)
+  out = {}
+  files.compact.uniq.each_slice(50) do |sl|
+    titles = sl.map { |f| "File:#{f}" }
+    q = get(COMMONS, action: 'query', titles: titles.join('|'), prop: 'imageinfo', iiprop: 'extmetadata', iiextmetadatafilter: 'Artist|LicenseShortName', formatversion: 2)['query']
+    by = {}
+    (q['pages'] || []).each do |p|
+      md = p.dig('imageinfo', 0, 'extmetadata') || {}
+      by[p['title']] = { 'artist' => md.dig('Artist', 'value').to_s.gsub(/<[^>]+>/, '').strip, 'license' => md.dig('LicenseShortName', 'value').to_s }
+    end
+    sl.each { |f| (c = by[follow(q, "File:#{f}")]) && (out[f] = c) }
+  end
+  out
+end
+
+def player_model(id, e, bios, credits)
+  ref = ->(p) { claims(e, p).map { |c| val(c)['id'] }.compact }
+  lab = ->(i) { i ? $labels[i].to_s : '' }
+  teams = claims(e, 'P54').map do |c|
+    tid = val(c)['id']
+    apps = qual(c, 'P1350')
+    goals = qual(c, 'P1351')
+    { 'id' => tid, 'label' => lab.call(tid), 'national' => !!(lab.call(tid) =~ NATIONAL_RE),
+      's' => year_of(qual(c, 'P580')), 'e' => year_of(qual(c, 'P582')),
+      'apps' => apps && apps['amount'].to_i, 'goals' => goals && goals['amount'].to_i,
+      'loan' => (c.dig('qualifiers', 'P1642') || []).any? { |x| x.dig('datavalue', 'value', 'id') == 'Q2914547' } }
+  end
+  awards = claims(e, 'P166').map { |c| { 'label' => lab.call(val(c)['id']), 'y' => year_of(qual(c, 'P585')) } }
+  born = claims(e, 'P569').first
+  h = claims(e, 'P2048').first
+  height = if h
+             v = val(h)
+             a = v['amount'].to_f
+             v['unit'].to_s.end_with?('Q11573') ? format('%.2f m', a) : "#{a == a.to_i ? a.to_i : a} cm"
+           else '' end
+  facts = [['Born', born ? fmt_date(val(born)) : ''], ['Birthplace', lab.call(ref.call('P19').first)],
+           ['Nation', lab.call(ref.call('P1532').first || ref.call('P27').first)],
+           ['Position', ref.call('P413').map { |i| lab.call(i) }.reject(&:empty?).first(2).join(', ')],
+           ['Height', height], ['Sport', lab.call(ref.call('P641').first)]].reject { |_, v| v.to_s.empty? }
+  wiki = e.dig('sitelinks', 'enwiki', 'title')
+  img = claims(e, 'P18').first
+  img = img && val(img)
+  num = claims(e, 'P1618').first
+  { 'id' => id, 'name' => e.dig('labels', 'en', 'value') || (e['labels'] || {}).values.first&.dig('value') || id,
+    'desc' => e.dig('descriptions', 'en', 'value').to_s, 'wiki' => wiki, 'bio' => wiki ? bios[wiki].to_s : '',
+    'img' => img, 'credit' => img && credits[img], 'num' => num && val(num).to_s,
+    'facts' => facts, 'teams' => teams, 'awards' => awards, 'built' => NOW.iso8601 }
+end
+
+def build_players(team_ids)
+  FileUtils.mkdir_p(PLAYERS)
+  all = {}
+  current = {}
+  team_ids.each do |tid|
+    f = File.join(TEAMS, "#{tid}.json")
+    next unless File.exist?(f)
+    t = JSON.parse(File.read(f))
+    t['rows'].each { |r| all[r[0]] = true }
+    (t['ws'] || {}).each do |y, s|
+      next unless s
+      s['players'].each do |p|
+        next unless p['id']
+        all[p['id']] = true
+        current[p['id']] = true if y.to_i == CUR
+      end
+    end
+  end
+  ids = all.keys.select { |i| i =~ /\AQ\d+\z/ }
+  # refresh: anyone not copied yet, current squads (stats change), and a rotating 1/30th of everyone else
+  slot = NOW.yday % 30
+  todo = ids.select { |i| FULL || current[i] || Zlib.crc32(i) % 30 == slot || !File.exist?(File.join(PLAYERS, "#{i}.json")) }
+  puts "Players: #{ids.size} in total, copying #{todo.size} (#{current.size} in current squads)"
+  done = 0
+  failed = 0
+  todo.each_slice(50).with_index do |chunk, n|
+    begin
+      ents = get(WD, action: 'wbgetentities', ids: chunk.join('|'), props: 'labels|descriptions|claims|sitelinks', languages: 'en', sitefilter: 'enwiki')['entities']
+      ents = ents.reject { |_, e| e.key?('missing') }
+      refs = ents.values.flat_map do |e|
+        %w[P19 P27 P1532 P413 P641 P54 P166].flat_map { |p| claims(e, p).map { |c| val(c)['id'] } }
+      end
+      fetch_labels(refs)
+      bios = fetch_bios(ents.values.map { |e| e.dig('sitelinks', 'enwiki', 'title') })
+      credits = fetch_credits(ents.values.map { |e| (c = claims(e, 'P18').first) && val(c) })
+      ents.each do |id, e|
+        File.write(File.join(PLAYERS, "#{id}.json"), JSON.generate(player_model(id, e, bios, credits)))
+        done += 1
+      end
+    rescue StandardError => e
+      failed += chunk.size
+      warn "    players batch #{n + 1} failed: #{e.message[0, 120]}"
+    end
+    puts "  players: #{done} copied" if (n + 1) % 40 == 0
+  end
+  puts "Players: #{done} copied#{failed > 0 ? ", #{failed} failed (they load live; retried tomorrow)" : ''}"
+  failed
+end
+
 # ---------- main ----------
 FileUtils.mkdir_p(TEAMS)
 t0 = Time.now
@@ -346,6 +485,7 @@ clubs.each_with_index do |c, i|
     puts "FAILED: #{e.message[0, 120]}"
   end
 end
+failed << 'some players' if build_players(clubs.map { |c| c['id'] }) > 0
 mins = ((Time.now - t0) / 60).round(1)
 puts "Done in #{mins} min, #{$requests} requests. #{failed.empty? ? 'No failures.' : "Failed: #{failed.join(', ')} (they'll load live; rerun to retry)"}"
 exit(failed.empty? ? 0 : 1)
